@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API layer - API Gateway and monitoring'
+
+# API Gateway and CloudWatch monitoring
+# Deploy this stack last
+
+Parameters:
+  # API configuration
+  ProjectName:
+    Type: String
+    Default: 'opensearch-redis-pipeline'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+Resources:
+  # REST API with regional endpoint
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: 'API for OpenSearch Redis Pipeline'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resources
+  # URL path definitions for different functionality
+  # Each resource maps to specific Lambda function capabilities
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGateway
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: 'search'
+
+  CacheResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGateway
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: 'cache'
+
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGateway
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: 'health'
+
+  # API Gateway Methods
+  # HTTP method definitions with Lambda proxy integration
+  # Enables seamless request/response handling between API Gateway and Lambda
+  SearchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref SearchResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: 
+              Fn::ImportValue: !Sub '${ProjectName}-${Environment}-api-handler-function-arn'
+      MethodResponses:
+        - StatusCode: 200
+
+  CacheMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref CacheResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: 
+              Fn::ImportValue: !Sub '${ProjectName}-${Environment}-api-handler-function-arn'
+      MethodResponses:
+        - StatusCode: 200
+
+  HealthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: 
+              Fn::ImportValue: !Sub '${ProjectName}-${Environment}-api-handler-function-arn'
+      MethodResponses:
+        - StatusCode: 200
+
+
+  # Lambda Permissions for API Gateway
+  # IAM permission allowing API Gateway to invoke Lambda functions
+  # Required for proper API-to-Lambda communication
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: 
+        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-api-handler-function-name'
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*'
+
+  # API Gateway Deployment
+  # Activates the API configuration and makes it accessible
+  # Creates a stage for the specified environment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchMethod
+      - CacheMethod
+      - HealthMethod
+    Properties:
+      RestApiId: !Ref APIGateway
+      StageName: !Ref Environment
+
+
+  # CloudWatch Dashboard
+  # Comprehensive monitoring view of the entire pipeline
+  # Displays metrics for Lambda functions, API Gateway, and data stores
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-data-generator" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Data Generator Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-data-processor" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Data Processor Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-${Environment}-api" ],
+                  [ ".", "Latency", ".", "." ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "CurrConnections", "CacheClusterId", "${ProjectName}-${Environment}-redis" ],
+                  [ ".", "BytesUsedForCache", ".", "." ],
+                  [ ".", "CacheHits", ".", "." ],
+                  [ ".", "CacheMisses", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ElastiCache Redis Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  # Automated monitoring and alerting for system health
+  # Configured to detect errors and performance issues
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-error-rate'
+      AlarmDescription: 'High error rate detected'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${ProjectName}-${Environment}-data-processor'
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-latency'
+      AlarmDescription: 'High API latency detected'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-${Environment}-api'
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # SNS Topic for Alarms
+  # Notification channel for alarm events
+  # Can be subscribed to for email or SMS alerts
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alarms'
+      DisplayName: 'Pipeline Alarms'
+
+  # API Gateway Usage Plan
+  # Traffic management and throttling controls
+  # Prevents abuse and ensures fair resource usage
+  APIUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: APIDeployment
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-${Environment}-usage-plan'
+      Description: 'Usage plan for API throttling'
+      ApiStages:
+        - ApiId: !Ref APIGateway
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # API Key
+  # Authentication mechanism for API access
+  # Provides basic security and usage tracking
+  APIKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-key'
+      Description: 'API key for pipeline access'
+      Enabled: true
+
+  # Usage Plan Key
+  # Associates API key with usage plan
+  # Enables rate limiting and quota enforcement
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref APIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref APIUsagePlan
+
+Outputs:
+  # Export API endpoints and monitoring resources
+  # These values provide access points and monitoring URLs for the pipeline
+  APIGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref APIGateway
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-gateway-id'
+
+  APIGatewayURL:
+    Description: 'API Gateway URL'
+    Value: !Sub 'https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-gateway-url'
+
+  APIKey:
+    Description: 'API Key'
+    Value: !Ref APIKey
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-key'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-monitoring'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+
+  SNSAlarmTopicArn:
+    Description: 'SNS Alarm Topic ARN'
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sns-alarm-topic-arn'

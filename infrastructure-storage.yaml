@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Storage layer - ElastiCache Redis and OpenSearch'
+
+# Data stores: Redis cluster and OpenSearch domain
+# Deploy after base infrastructure
+
+Parameters:
+  # Storage configuration
+  ProjectName:
+    Type: String
+    Default: 'opensearch-redis-pipeline'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: 't3.small.elasticsearch'
+    AllowedValues: 
+      - 't3.small.elasticsearch'
+      - 't2.small.elasticsearch'
+      - 'm5.large.elasticsearch'
+      - 'm5.xlarge.elasticsearch'
+    Description: 'OpenSearch instance type'
+
+  ElastiCacheInstanceType:
+    Type: String
+    Default: 'cache.t3.micro'
+    AllowedValues:
+      - 'cache.t3.micro'
+      - 'cache.t3.small'
+      - 'cache.m5.large'
+      - 'cache.m5.xlarge'
+    Description: 'ElastiCache instance type'
+
+Resources:
+  # Data storage and search infrastructure components
+  # Includes Redis cluster and OpenSearch domain with security configurations
+  # ElastiCache Subnet Group
+  # Defines which subnets the Redis cluster can be deployed in
+  # Uses private subnets from the base infrastructure stack
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: 'Subnet group for ElastiCache Redis cluster'
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-2-id'
+
+  # ElastiCache Redis Cluster
+  # High-performance in-memory cache for fast data access
+  # Configured with encryption, multi-AZ, and automatic failover
+  ElastiCacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: 'Redis cluster for data caching'
+      ReplicationGroupId: !Sub '${ProjectName}-${Environment}-redis'
+      Engine: redis
+      EngineVersion: '7.0'
+      CacheNodeType: !Ref ElastiCacheInstanceType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      Port: 6379
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-elasticache-sg-id'
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      SnapshotRetentionLimit: 1
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-redis-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Redis Auth Token (stored in Secrets Manager)
+  # Secure storage for Redis authentication credentials
+  # Auto-generated token with appropriate complexity
+  RedisAuthToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-redis-auth-token'
+      Description: 'Authentication token for Redis cluster'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: 'auth-token'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  # OpenSearch Service Domain
+  # Full-text search and analytics engine for indexed data
+  # VPC-deployed with encryption and proper access controls
+  OpenSearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Sub 'os-redis-${Environment}'
+      ElasticsearchVersion: '7.10'
+      
+      ElasticsearchClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+        
+      VPCOptions:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-opensearch-sg-id'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+          
+      EncryptionAtRestOptions:
+        Enabled: true
+        
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+        
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+        
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/os-redis-${Environment}/*'
+          - Effect: Allow
+            Principal:
+              AWS: 
+                Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/os-redis-${Environment}/*'
+            
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-opensearch-domain'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups
+  # Centralized logging for monitoring and troubleshooting
+  # Short retention period for cost optimization
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${ProjectName}-${Environment}-domain'
+      RetentionInDays: 7
+
+  ElastiCacheLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/elasticache/${ProjectName}-${Environment}-redis'
+      RetentionInDays: 7
+
+  # Parameter Store entries for easy access
+  # Convenient way to share configuration values across services
+  # Avoids hardcoding endpoints in application code
+  OpenSearchEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/opensearch/endpoint'
+      Type: String
+      Value: !GetAtt OpenSearchDomain.DomainEndpoint
+      Description: 'OpenSearch domain endpoint'
+
+  RedisEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/redis/endpoint'
+      Type: String
+      Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Address
+      Description: 'Redis primary endpoint'
+
+  RedisPortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/redis/port'
+      Type: String
+      Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Port
+      Description: 'Redis port'
+
+Outputs:
+  # Export storage service endpoints and configuration
+  # These values are used by compute and API layers
+  OpenSearchDomainName:
+    Description: 'OpenSearch Domain Name'
+    Value: !Ref OpenSearchDomain
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-opensearch-domain-name'
+
+  OpenSearchDomainEndpoint:
+    Description: 'OpenSearch Domain Endpoint'
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-opensearch-endpoint'
+
+  OpenSearchDomainArn:
+    Description: 'OpenSearch Domain ARN'
+    Value: !GetAtt OpenSearchDomain.DomainArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-opensearch-domain-arn'
+
+  RedisPrimaryEndpoint:
+    Description: 'Redis Primary Endpoint'
+    Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-primary-endpoint'
+
+  RedisPort:
+    Description: 'Redis Port'
+    Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-port'
+
+  RedisAuthTokenSecretArn:
+    Description: 'Redis Auth Token Secret ARN'
+    Value: !Ref RedisAuthToken
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-redis-auth-token-secret-arn'
+
+  OpenSearchLogGroupName:
+    Description: 'OpenSearch Log Group Name'
+    Value: !Ref OpenSearchLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-opensearch-log-group-name'
+
+  ElastiCacheLogGroupName:
+    Description: 'ElastiCache Log Group Name'
+    Value: !Ref ElastiCacheLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-elasticache-log-group-name'

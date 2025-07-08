@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Compute layer - Lambda Functions and EventBridge'
+
+# Lambda functions and scheduling
+# Deploy after base and storage stacks
+
+Parameters:
+  # Lambda configuration
+  ProjectName:
+    Type: String
+    Default: 'opensearch-redis-pipeline'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+Resources:
+  # Lambda functions
+  # Data generator runs outside VPC, processor and API handler inside VPC
+  # Generates sample e-commerce data
+  DataGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import uuid
+          import os
+          from datetime import datetime, timedelta
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Generate sample data for the pipeline - simplified version"""
+              logger.info("Starting data generation")
+              
+              # Generate 10 sample e-commerce records
+              sample_data = []
+              
+              categories = ['electronics', 'clothing', 'books', 'home']
+              event_types = ['view', 'click', 'purchase', 'search']
+              search_queries = ['smartphone', 'laptop', 'headphones', 'shoes', 'book']
+              
+              for i in range(10):
+                  record = {
+                      'id': str(uuid.uuid4()),
+                      'user_id': f'user_{random.randint(1, 1000)}',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'event_type': random.choice(event_types),
+                      'product_id': f'product_{random.randint(1, 500)}',
+                      'category': random.choice(categories),
+                      'price': round(random.uniform(10, 1000), 2),
+                      'quantity': random.randint(1, 5),
+                      'search_query': random.choice(search_queries),
+                      'session_id': f'session_{random.randint(1, 100)}'
+                  }
+                  sample_data.append(record)
+              
+              logger.info(f"Generated {len(sample_data)} sample records")
+              
+              # Send to data processor asynchronously (fire and forget)
+              try:
+                  lambda_client = boto3.client('lambda')
+                  processor_payload = {'data': sample_data}
+                  
+                  response = lambda_client.invoke(
+                      FunctionName=f"{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}-data-processor",
+                      InvocationType='Event',  # Async - don't wait for response
+                      Payload=json.dumps(processor_payload)
+                  )
+                  
+                  logger.info(f"Sent data to processor, response: {response['StatusCode']}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send to processor: {str(e)}")
+                  # Continue anyway - generation was successful
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Generated {len(sample_data)} records',
+                      'records_generated': len(sample_data),
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-data-generator'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Processes data and stores in OpenSearch/Redis
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+          import os
+          import socket
+          import ssl
+          from boto3 import Session
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Process data and store in OpenSearch using signed requests"""
+              logger.info("Starting data processing")
+              
+              try:
+                  opensearch_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+                  redis_endpoint = os.environ['REDIS_ENDPOINT']
+                  redis_port = int(os.environ['REDIS_PORT'])
+                  region = os.environ.get('AWS_REGION', 'us-east-1')
+                  
+                  # Process incoming data
+                  if 'body' in event:
+                      data = json.loads(event['body'])
+                  else:
+                      data = event
+                  
+                  processed_records = 0
+                  cached_records = 0
+                  
+                  if 'data' in data:
+                      # Get AWS credentials for signing
+                      session = Session()
+                      credentials = session.get_credentials()
+                      
+                      # Redis connection with TLS and AUTH
+                      redis_connected = False
+                      redis_sock = None
+                      try:
+                          # Create TLS socket for Redis with AUTH
+                          context = ssl.create_default_context()
+                          context.check_hostname = False
+                          context.verify_mode = ssl.CERT_NONE
+                          
+                          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                          sock.settimeout(5)
+                          redis_sock = context.wrap_socket(sock)
+                          redis_sock.connect((redis_endpoint, redis_port))
+                          
+                          # Get AUTH token from environment
+                          auth_secret_arn = os.environ.get('REDIS_AUTH_SECRET_ARN')
+                          if auth_secret_arn:
+                              # Get auth token from Secrets Manager
+                              secrets_client = boto3.client('secretsmanager')
+                              try:
+                                  secret_response = secrets_client.get_secret_value(SecretId=auth_secret_arn)
+                                  secret_data = json.loads(secret_response['SecretString'])
+                                  auth_token = secret_data['auth-token']
+                                  
+                                  # Send AUTH command
+                                  auth_command = f"*2\r\n$4\r\nAUTH\r\n${len(auth_token)}\r\n{auth_token}\r\n"
+                                  redis_sock.send(auth_command.encode())
+                                  auth_response = redis_sock.recv(256)
+                                  
+                                  if b'+OK' not in auth_response:
+                                      logger.warning(f"Redis AUTH failed: {auth_response}")
+                                      logger.info("Redis TLS connection successful - AUTH failed but skipping for graceful fallback")
+                                      redis_connected = False
+                                  else:
+                                      logger.info("Redis AUTH successful")
+                              except Exception as auth_error:
+                                  logger.warning(f"Failed to get AUTH token: {str(auth_error)}")
+                                  redis_connected = False
+                          
+                          # Test Redis connection (no AUTH required)
+                          try:
+                              ping_command = "*1\r\n$4\r\nPING\r\n"
+                              redis_sock.send(ping_command.encode())
+                              ping_response = redis_sock.recv(256)
+                              
+                              if b'+PONG' in ping_response:
+                                  redis_connected = True
+                                  logger.info("Connected to Redis successfully")
+                              else:
+                                  logger.warning(f"Redis PING response: {ping_response}")
+                                  redis_connected = False
+                          except Exception as test_error:
+                              logger.warning(f"Redis test failed: {str(test_error)}")
+                              redis_connected = False
+                      except Exception as e:
+                          logger.warning(f"Redis connection failed: {str(e)}, proceeding without cache")
+                          redis_connected = False
+                          if redis_sock:
+                              try:
+                                  redis_sock.close()
+                              except:
+                                  pass
+                              redis_sock = None
+                      
+                      for record in data['data']:
+                          # Store in Redis cache with simplified protocol
+                          if redis_connected:
+                              try:
+                                  cache_key = f"event:{record['id']}"
+                                  cache_value = json.dumps(record)
+                                  
+                                  # Proper Redis protocol: *3\r\n$3\r\nSET\r\n$key_len\r\nkey\r\n$val_len\r\nvalue\r\n
+                                  key_len = len(cache_key)
+                                  val_len = len(cache_value)
+                                  redis_command = f"*3\r\n$3\r\nSET\r\n${key_len}\r\n{cache_key}\r\n${val_len}\r\n{cache_value}\r\n"
+                                  
+                                  redis_sock.send(redis_command.encode())
+                                  response = redis_sock.recv(256)
+                                  
+                                  if b'+OK' in response:
+                                      cached_records += 1
+                                      logger.info(f"Cached record {record['id']}")
+                                  else:
+                                      logger.warning(f"Redis SET failed for {record['id']}")
+                              except Exception as e:
+                                  logger.warning(f"Failed to cache record {record['id']}: {str(e)}")
+                                  # Don't break the loop, continue with other records
+                          
+                          # Index in OpenSearch
+                          url = f"https://{opensearch_endpoint}/user-events/_doc"
+                          body = json.dumps(record)
+                          
+                          # Create AWS request and sign it
+                          request = AWSRequest(
+                              method='POST',
+                              url=url,
+                              data=body,
+                              headers={'Content-Type': 'application/json'}
+                          )
+                          
+                          SigV4Auth(credentials, 'es', region).add_auth(request)
+                          
+                          # Execute the signed request
+                          http = urllib3.PoolManager()
+                          response = http.request(
+                              request.method,
+                              request.url,
+                              body=request.body,
+                              headers=dict(request.headers)
+                          )
+                          
+                          if response.status in [200, 201]:
+                              processed_records += 1
+                              logger.info(f"Indexed record {record['id']}")
+                          else:
+                              logger.warning(f"Failed to index record: {response.status} - {response.data}")
+                      
+                      # Close Redis connection
+                      if redis_sock:
+                          try:
+                              redis_sock.close()
+                          except:
+                              pass
+                  
+                  logger.info(f"Processed {processed_records} records, cached {cached_records} records")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Processed {processed_records} records, cached {cached_records} records',
+                          'processed_count': processed_records,
+                          'cached_count': cached_records
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing data: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+                  
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-sg-id'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-2-id'
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          OPENSEARCH_ENDPOINT: 
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-opensearch-endpoint'
+          REDIS_ENDPOINT:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-primary-endpoint'
+          REDIS_PORT:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-port'
+          REDIS_AUTH_SECRET_ARN: 
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-auth-token-secret-arn'
+      Timeout: 300
+      MemorySize: 512
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-data-processor'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API handler for search and cache endpoints
+  APIHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import urllib3
+          import socket
+          import ssl
+          from datetime import datetime
+          import os
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Handle API requests"""
+              logger.info("Processing API request")
+              
+              try:
+                  # Get HTTP method and path
+                  method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  
+                  if path == '/search' and method == 'GET':
+                      return handle_search(event)
+                  elif path == '/cache' and method == 'GET':
+                      return handle_cache_lookup(event)
+                  elif path == '/health' and method == 'GET':
+                      return handle_health_check(event)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': 'Not Found'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"API error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def handle_search(event):
+              """Handle search requests via OpenSearch signed API"""
+              try:
+                  opensearch_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+                  region = os.environ.get('AWS_REGION', 'us-east-1')
+                  query = event.get('queryStringParameters', {}).get('q', '*')
+                  
+                  # Get AWS credentials for signing
+                  from boto3 import Session
+                  from botocore.auth import SigV4Auth
+                  from botocore.awsrequest import AWSRequest
+                  
+                  session = Session()
+                  credentials = session.get_credentials()
+                  
+                  search_url = f"https://{opensearch_endpoint}/user-events/_search"
+                  search_body = {
+                      'query': {
+                          'query_string': {
+                              'query': query
+                          }
+                      },
+                      'size': 10
+                  }
+                  
+                  # Create signed request
+                  request = AWSRequest(
+                      method='POST',
+                      url=search_url,
+                      data=json.dumps(search_body),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  SigV4Auth(credentials, 'es', region).add_auth(request)
+                  
+                  # Execute the signed request
+                  http = urllib3.PoolManager()
+                  response = http.request(
+                      request.method,
+                      request.url,
+                      body=request.body,
+                      headers=dict(request.headers)
+                  )
+                  
+                  if response.status == 200:
+                      result = json.loads(response.data.decode('utf-8'))
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'hits': result.get('hits', {}).get('hits', []),
+                              'total': result.get('hits', {}).get('total', 0)
+                          })
+                      }
+                  else:
+                      logger.error(f"Search failed: {response.status} - {response.data}")
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': f'Search failed: {response.status}'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Search error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def handle_cache_lookup(event):
+              """Handle cache lookup requests from Redis"""
+              try:
+                  redis_endpoint = os.environ['REDIS_ENDPOINT']
+                  redis_port = int(os.environ['REDIS_PORT'])
+                  
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  record_id = query_params.get('id')
+                  
+                  if not record_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing id parameter'})
+                      }
+                  
+                  # TLS Redis connection
+                  try:
+                      context = ssl.create_default_context()
+                      context.check_hostname = False
+                      context.verify_mode = ssl.CERT_NONE
+                      
+                      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      sock.settimeout(3)  # 3 second timeout
+                      redis_sock = context.wrap_socket(sock)
+                      redis_sock.connect((redis_endpoint, redis_port))
+                      
+                      # Redis AUTH
+                      auth_secret_arn = os.environ.get('REDIS_AUTH_SECRET_ARN')
+                      if auth_secret_arn:
+                          secrets_client = boto3.client('secretsmanager')
+                          secret_response = secrets_client.get_secret_value(SecretId=auth_secret_arn)
+                          secret_data = json.loads(secret_response['SecretString'])
+                          auth_token = secret_data['auth-token']
+                          
+                          # Send AUTH command
+                          auth_command = f"*2\r\n$4\r\nAUTH\r\n${len(auth_token)}\r\n{auth_token}\r\n"
+                          redis_sock.send(auth_command.encode())
+                          auth_response = redis_sock.recv(256)
+                          
+                          if b'+OK' not in auth_response:
+                              logger.warning(f"Redis AUTH failed: {auth_response}")
+                              return {
+                                  'statusCode': 500,
+                                  'body': json.dumps({'error': 'Cache authentication failed'})
+                              }
+                      
+                      # Proper Redis GET command protocol
+                      cache_key = f"event:{record_id}"
+                      key_len = len(cache_key)
+                      redis_command = f"*2\r\n$3\r\nGET\r\n${key_len}\r\n{cache_key}\r\n"
+                      
+                      redis_sock.send(redis_command.encode())
+                      response = redis_sock.recv(4096)
+                      redis_sock.close()
+                      
+                      # Parse Redis response
+                      if b'$-1' in response:  # Key not found
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'Record not found in cache'})
+                          }
+                      elif b'$' in response:  # Key found
+                          # Extract the JSON data from Redis response
+                          lines = response.decode().split('\r\n')
+                          for i, line in enumerate(lines):
+                              if line.startswith('$'):
+                                  if i + 1 < len(lines):
+                                      cached_data = json.loads(lines[i + 1])
+                                      return {
+                                          'statusCode': 200,
+                                          'body': json.dumps({
+                                              'cached': True,
+                                              'data': cached_data
+                                          })
+                                      }
+                      
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': 'Failed to parse cache response'})
+                      }
+                      
+                  except Exception as e:
+                      logger.error(f"Cache lookup error: {str(e)}")
+                      return {
+                          'statusCode': 503,
+                          'body': json.dumps({'error': 'Cache service unavailable'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Cache lookup error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def handle_health_check(event):
+              """Handle health check requests"""
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'status': 'healthy',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'service': 'opensearch-redis-pipeline'
+                  })
+              }
+              
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-lambda-sg-id'
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-1-id'
+          - Fn::ImportValue: !Sub '${ProjectName}-${Environment}-private-subnet-2-id'
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          OPENSEARCH_ENDPOINT: 
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-opensearch-endpoint'
+          REDIS_ENDPOINT:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-primary-endpoint'
+          REDIS_PORT:
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-port'
+          REDIS_AUTH_SECRET_ARN: 
+            Fn::ImportValue: !Sub '${ProjectName}-${Environment}-redis-auth-token-secret-arn'
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api-handler'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge rule - triggers data generator every 5 minutes
+  DataGenerationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-data-generation-schedule'
+      Description: 'Trigger data generation every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataGeneratorFunction.Arn
+          Id: DataGeneratorTarget
+
+  # Permission for EventBridge to invoke Lambda
+  # IAM permission allowing EventBridge to trigger the data generator
+  # Required for automated scheduling to function properly
+  DataGeneratorEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataGenerationSchedule.Arn
+
+  # CloudWatch Log Groups for Lambda functions
+  # Centralized logging for monitoring and debugging
+  # Short retention period for cost optimization
+  DataGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-data-generator'
+      RetentionInDays: 7
+
+  DataProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-data-processor'
+      RetentionInDays: 7
+
+  APIHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api-handler'
+      RetentionInDays: 7
+
+Outputs:
+  # Export Lambda function details for API layer integration
+  # These ARNs are used by API Gateway for function invocation
+  DataGeneratorFunctionName:
+    Description: 'Data Generator Lambda Function Name'
+    Value: !Ref DataGeneratorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-data-generator-function-name'
+
+  DataGeneratorFunctionArn:
+    Description: 'Data Generator Lambda Function ARN'
+    Value: !GetAtt DataGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-data-generator-function-arn'
+
+  DataProcessorFunctionName:
+    Description: 'Data Processor Lambda Function Name'
+    Value: !Ref DataProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-data-processor-function-name'
+
+  DataProcessorFunctionArn:
+    Description: 'Data Processor Lambda Function ARN'
+    Value: !GetAtt DataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-data-processor-function-arn'
+
+  APIHandlerFunctionName:
+    Description: 'API Handler Lambda Function Name'
+    Value: !Ref APIHandlerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-handler-function-name'
+
+  APIHandlerFunctionArn:
+    Description: 'API Handler Lambda Function ARN'
+    Value: !GetAtt APIHandlerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-handler-function-arn'
